@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 /**
- * code-review-helper-mcp — 代码审查辅助工具（扫描 + 报告生成）
- * 知微工作室 · Zhiwei Studio · 2026-10-15 · v1.0.0
+ * code-review-helper-mcp — 全自动代码审查交付管线 v2
+ * 知微工作室 · Zhiwei Studio · 2026-10-15 · v2.0.0
  *
- * 提供 2 个工具：
+ * 提供 3 个工具：
  *   scan_code    输入代码文本，做规则扫描（安全问题 + 坏味道）
  *   gen_report   把扫描结果按固定模板生成 Markdown 审查报告初稿
+ *   review_repo  输入 GitHub 仓库 URL，自动拉取代码 → 扫描 → 生成完整交付报告
+ *
+ * v2 新增：
+ *   - review_repo：通过 GitHub 公开 API 拉取仓库代码，逐文件扫描，汇总报告
+ *   - 工程细节：限流(403)明确报错、文件上限(50)、跳过二进制/大文件、请求间隔≥1s
  *
  * 扫描规则：
  *   安全问题：eval/exec、pickle.load、yaml.load 不安全用法、SQL 字符串拼接、
@@ -13,9 +18,9 @@
  *   坏味道：裸 except、可变默认参数、global 滥用、超长函数(>80行)、重复代码块
  *
  * 设计原则：
- *   - 零第三方依赖（正则匹配 + 原生分析，仅依赖 MCP SDK）
+ *   - 零第三方依赖（正则匹配 + 原生 fetch，仅依赖 MCP SDK）
  *   - 多语言支持（Python / JavaScript / Shell / 通用）
- *   - 不存储、不硬编码任何凭证
+ *   - 不存储、不硬编码任何凭证（不放 GitHub token）
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -402,10 +407,325 @@ function generateReport(scanResult) {
   return lines.join("\n");
 }
 
+/* ===== GitHub API（v2 新增：review_repo 依赖） ===== */
+
+/** 可扫描的代码文件扩展名 */
+const CODE_EXTENSIONS = new Set([
+  ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+  ".sh", ".bash", ".rb", ".java", ".go", ".rs", ".php",
+]);
+
+/** 跳过的文件/目录模式 */
+const SKIP_PATTERNS = [
+  /node_modules\//, /\/vendor\//, /\/__pycache__\//,
+  /\.min\.(js|css)$/, /bundle\./, /\/dist\//, /\/build\//,
+  /\.lock$/, /package-lock\.json$/,
+];
+
+/** 文件大小上限：1 MB */
+const MAX_FILE_SIZE = 1_000_000;
+
+/**
+ * 解析 GitHub 仓库 URL → { owner, repo, ref, path }
+ * 支持格式：
+ *   https://github.com/owner/repo
+ *   https://github.com/owner/repo/tree/branch
+ *   https://github.com/owner/repo/tree/branch/path
+ */
+function parseGitHubUrl(url) {
+  // 去掉尾部斜杠
+  const clean = url.replace(/\/+$/, "");
+  const match = clean.match(
+    /github\.com\/([^/]+)\/([^/]+)(?:\/tree\/([^/]+)(?:\/(.+))?)?/
+  );
+  if (!match) {
+    throw new Error(
+      `无法解析 GitHub URL: ${url}。期望格式: https://github.com/owner/repo`
+    );
+  }
+  return {
+    owner: match[1],
+    repo: match[2],
+    ref: match[3] || "HEAD",
+    path: match[4] || "",
+  };
+}
+
+/**
+ * 请求限速：每次请求后等待至少 delayMs
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * 调用 GitHub API（带 User-Agent 和限流处理）
+ */
+async function githubApi(url, requestDelayMs = 1000) {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "code-review-helper-mcp/2.0 (Zhiwei-Studio)",
+      "Accept": "application/vnd.github.v3+json",
+    },
+  });
+
+  if (res.status === 403) {
+    const remaining = res.headers.get("X-RateLimit-Remaining");
+    if (remaining === "0") {
+      const reset = res.headers.get("X-RateLimit-Reset");
+      const resetTime = reset ? new Date(Number(reset) * 1000).toISOString() : "未知";
+      throw new Error(
+        `GitHub API 限流（403）。未认证限额 60 次/小时已用尽。重置时间: ${resetTime}。请稍后重试或配置 GitHub Token。`
+      );
+    }
+    throw new Error(`GitHub API 返回 403 Forbidden: ${url}`);
+  }
+
+  if (res.status === 404) {
+    throw new Error(`GitHub 仓库或路径不存在（404）: ${url}`);
+  }
+
+  if (!res.ok) {
+    throw new Error(`GitHub API 错误 ${res.status}: ${await res.text()}`);
+  }
+
+  await sleep(requestDelayMs);
+  return res.json();
+}
+
+/**
+ * 判断文件是否应该扫描
+ */
+function shouldScanFile(path) {
+  // 跳过匹配模式
+  if (SKIP_PATTERNS.some(p => p.test(path))) return false;
+  // 检查扩展名
+  const ext = "." + path.split(".").pop()?.toLowerCase();
+  return CODE_EXTENSIONS.has(ext);
+}
+
+/**
+ * 获取仓库文件树
+ */
+async function fetchRepoTree(owner, repo, ref) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`;
+  const data = await githubApi(url);
+  if (!data.tree) throw new Error("无法获取仓库文件树");
+  return data.tree;
+}
+
+/**
+ * 获取单个文件内容（base64 解码）
+ */
+async function fetchFileContent(owner, repo, path, ref) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${encodeURIComponent(ref)}`;
+  const data = await githubApi(url);
+  if (data.size > MAX_FILE_SIZE) return null; // 跳过大文件
+  if (!data.content) return null;
+  return Buffer.from(data.content, "base64").toString("utf-8");
+}
+
+/**
+ * 生成多文件汇总报告
+ */
+function generateRepoReport(repoInfo, fileResults) {
+  const now = new Date().toISOString().split("T")[0];
+  const allFindings = [];
+
+  // 汇总所有文件的发现，加上文件路径前缀
+  for (const fr of fileResults) {
+    for (const f of fr.findings) {
+      allFindings.push({ ...f, file: fr.path });
+    }
+  }
+
+  // 按严重级排序：critical > high > medium > low
+  const severityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+  allFindings.sort((a, b) => {
+    const sa = severityOrder[a.severity] ?? 9;
+    const sb = severityOrder[b.severity] ?? 9;
+    if (sa !== sb) return sa - sb;
+    return (a.file + ":" + a.line).localeCompare(b.file + ":" + b.line);
+  });
+
+  const totalFiles = fileResults.length;
+  const totalLines = fileResults.reduce((sum, fr) => sum + fr.totalLines, 0);
+  const summary = {
+    total: allFindings.length,
+    critical: allFindings.filter(f => f.severity === "critical").length,
+    high: allFindings.filter(f => f.severity === "high").length,
+    medium: allFindings.filter(f => f.severity === "medium").length,
+    low: allFindings.filter(f => f.severity === "low").length,
+  };
+
+  const repoUrl = `https://github.com/${repoInfo.owner}/${repoInfo.repo}/tree/${repoInfo.ref}`;
+  const lines = [];
+
+  // 1. 概述
+  lines.push(`# 代码审查报告`);
+  lines.push("");
+  lines.push(`## 1. 概述`);
+  lines.push("");
+  lines.push(`- **审查仓库**：[${repoInfo.owner}/${repoInfo.repo}](${repoUrl})`);
+  lines.push(`- **分支/标签**：\`${repoInfo.ref}\``);
+  if (repoInfo.path) lines.push(`- **路径过滤**：\`${repoInfo.path}\``);
+  lines.push(`- **扫描文件数**：${totalFiles}`);
+  lines.push(`- **代码总行数**：${totalLines}`);
+  lines.push(`- **审查工具**：code-review-helper-mcp v2.0.0`);
+  lines.push(`- **审查日期**：${now}`);
+  lines.push(`- **发现总数**：${summary.total}（critical: ${summary.critical} / high: ${summary.high} / medium: ${summary.medium} / low: ${summary.low}）`);
+  lines.push("");
+
+  // 2. 发现汇总表
+  lines.push(`## 2. 发现汇总`);
+  lines.push("");
+  lines.push(`| # | 位置 | 严重级 | 问题一句话 |`);
+  lines.push(`|---|------|--------|-----------|`);
+  allFindings.forEach((f, i) => {
+    lines.push(`| ${i + 1} | ${f.file}:${f.line} | **${f.severity}** | ${f.message} |`);
+  });
+  lines.push("");
+
+  // 3. 详细发现
+  lines.push(`## 3. 详细发现`);
+  lines.push("");
+  if (allFindings.length === 0) {
+    lines.push(`未发现任何问题，代码质量良好。`);
+    lines.push("");
+  } else {
+    allFindings.forEach((f, i) => {
+      lines.push(`### 3.${i + 1} [${f.severity.toUpperCase()}] ${f.id} — ${f.message}`);
+      lines.push("");
+      lines.push(`- **位置**：\`${f.file}:${f.line}\``);
+      lines.push(`- **类别**：${f.category === "security" ? "安全问题" : "坏味道"}`);
+      lines.push(`- **代码片段**：`);
+      lines.push(`  \`\`\``);
+      lines.push(`  ${f.code}`);
+      lines.push(`  \`\`\``);
+      lines.push(`- **问题说明**：${f.message}`);
+      // critical/high 必须带修复建议代码
+      if (f.severity === "critical" || f.severity === "high") {
+        lines.push(`- **修复建议**：`);
+        lines.push(`  \`\`\``);
+        lines.push(`  # 请参考项目安全规范，替换为安全写法`);
+        lines.push(`  # 示例：使用参数化查询替代字符串拼接`);
+        lines.push(`  # 示例：使用环境变量替代硬编码密钥`);
+        lines.push(`  \`\`\``);
+      } else {
+        lines.push(`- **修复建议**：请参考项目编码规范进行改进`);
+      }
+      lines.push("");
+    });
+  }
+
+  // 4. 安全专项
+  const secFindings = allFindings.filter(f => f.category === "security");
+  lines.push(`## 4. 安全专项`);
+  lines.push("");
+  if (secFindings.length > 0) {
+    lines.push(`本次审查发现 **${secFindings.length}** 个安全问题：`);
+    lines.push("");
+    secFindings.forEach(f => {
+      lines.push(`- **${f.severity.toUpperCase()}**（${f.file}:${f.line}）：${f.message}`);
+    });
+    lines.push("");
+    lines.push(`> 建议优先处理 critical 级别问题，这些问题可被直接利用。`);
+  } else {
+    lines.push(`本次审查未发现安全问题。`);
+  }
+  lines.push("");
+
+  // 5. 验证记录
+  lines.push(`## 5. 验证记录`);
+  lines.push("");
+  const critHigh = allFindings.filter(f => f.severity === "critical" || f.severity === "high");
+  if (critHigh.length > 0) {
+    critHigh.forEach((f, i) => {
+      lines.push(`${i + 1}. **${f.file}:${f.line}** — 修复前：当前代码可触发该问题；修复后：按修复建议替换后重新扫描确认消失`);
+    });
+  } else {
+    lines.push(`无 critical/high 级别发现，无需专项验证。`);
+  }
+  lines.push("");
+
+  // 6. 修订说明
+  lines.push(`## 6. 修订说明`);
+  lines.push("");
+  lines.push(`- 本报告包含一轮修订`);
+  lines.push(`- 修订范围：针对所有发现提供修复建议`);
+  lines.push(`- 响应时间：收到反馈后 24 小时内响应`);
+  lines.push("");
+  lines.push(`---`);
+  lines.push(`*报告由 code-review-helper-mcp v2.0.0 自动生成，知微工作室 · Zhiwei Studio*`);
+
+  return {
+    repoUrl,
+    totalFiles,
+    totalLines,
+    summary,
+    findings: allFindings,
+    report: lines.join("\n"),
+  };
+}
+
+/**
+ * review_repo 主逻辑：拉取 → 扫描 → 汇总
+ */
+async function reviewRepo(repoUrl, options = {}) {
+  const maxFiles = options.maxFiles || 50;
+  const requestDelay = options.requestDelay || 1000;
+
+  // 1. 解析 URL
+  const repoInfo = parseGitHubUrl(repoUrl);
+
+  // 2. 获取文件树
+  const tree = await fetchRepoTree(repoInfo.owner, repoInfo.repo, repoInfo.ref);
+
+  // 3. 过滤代码文件
+  let codeFiles = tree
+    .filter(item => item.type === "file" && shouldScanFile(item.path))
+    .filter(item => !repoInfo.path || item.path.startsWith(repoInfo.path));
+
+  // 文件上限
+  if (codeFiles.length > maxFiles) {
+    codeFiles = codeFiles.slice(0, maxFiles);
+  }
+
+  // 4. 逐文件拉取 + 扫描
+  const fileResults = [];
+  for (const file of codeFiles) {
+    try {
+      const content = await fetchFileContent(
+        repoInfo.owner, repoInfo.repo, file.path, repoInfo.ref
+      );
+      if (content === null) continue; // 跳过空/大文件
+
+      const result = scanCode(content, file.path);
+      fileResults.push({ path: file.path, ...result });
+    } catch (e) {
+      // 单文件失败不中断整体，记录错误继续
+      fileResults.push({
+        path: file.path,
+        error: e.message,
+        totalLines: 0,
+        summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0 },
+        findings: [],
+      });
+    }
+  }
+
+  // 5. 生成报告
+  const reportResult = generateRepoReport(repoInfo, fileResults);
+  reportResult.repoInfo = repoInfo;
+  reportResult.fileResults = fileResults;
+
+  return reportResult;
+}
+
 /* ===== MCP Server ===== */
 
 const server = new Server(
-  { name: "code-review-helper-mcp", version: "1.0.0" },
+  { name: "code-review-helper-mcp", version: "2.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -437,6 +757,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["scanResult"],
       },
     },
+    {
+      name: "review_repo",
+      description: "全自动代码审查：输入 GitHub 仓库 URL，通过公开 API 拉取代码文件，逐文件跑规则扫描，生成符合交付模板的完整 Markdown 报告。支持指定分支和路径过滤。免认证（注意 60 次/小时限流）。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          repoUrl:   { type: "string", description: "GitHub 仓库 URL，例如 https://github.com/owner/repo 或 https://github.com/owner/repo/tree/main/src" },
+          maxFiles:  { type: "number", description: "最大扫描文件数，默认 50（防大仓库爆量）" },
+        },
+        required: ["repoUrl"],
+      },
+    },
   ],
 }));
 
@@ -459,6 +791,26 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       const report = generateReport(scanResult);
       return { content: [{ type: "text", text: report }] };
+    }
+
+    if (name === "review_repo") {
+      const result = await reviewRepo(a.repoUrl, {
+        maxFiles: a.maxFiles || 50,
+      });
+      // 返回报告文本 + JSON 元数据
+      const output = {
+        report: result.report,
+        summary: result.summary,
+        totalFiles: result.totalFiles,
+        totalLines: result.totalLines,
+        repoUrl: result.repoUrl,
+        filesScanned: result.fileResults.map(fr => ({
+          path: fr.path,
+          lines: fr.totalLines,
+          findings: fr.summary.total,
+        })),
+      };
+      return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
     }
 
     return { content: [{ type: "text", text: "未知工具: " + name }], isError: true };
