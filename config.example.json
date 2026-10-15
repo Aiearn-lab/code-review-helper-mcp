@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "code-review-helper": {
+      "command": "node",
+      "args": ["/你的绝对路径/code-review-helper-mcp/index.js"]
+    }
+  }
+}
