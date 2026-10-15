@@ -1,3 +1,5 @@
+> **知微工作室 / Zhiwei Studio** — AI 工程外包：代码审查、数据清洗、论文复现、自动化脚本。官网与在线下单：https://ai-eng-capability.app.workbuddy.host/ ｜ 合作邮箱：cqsj6667@agent.qq.com
+
 # code-review-helper-mcp · 全自动代码审查交付管线
 
 > 知微工作室 · Zhiwei Studio｜2026-10-15｜v2.0.0｜Node 18+，MIT
