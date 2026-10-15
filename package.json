@@ -1,0 +1,12 @@
+{
+  "name": "code-review-helper-mcp",
+  "version": "1.0.0",
+  "description": "代码审查辅助 MCP 工具 — Zhiwei Studio / 知微工作室",
+  "type": "module",
+  "main": "index.js",
+  "bin": { "code-review-helper-mcp": "index.js" },
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node test.js" },
+  "dependencies": { "@modelcontextprotocol/sdk": "^1.17.0" },
+  "license": "MIT"
+}
